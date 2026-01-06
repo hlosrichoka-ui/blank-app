@@ -58,7 +58,20 @@ if st.button("Analyze Sequence"):
         st.error("Please paste a sequence.")
         st.stop()
 
-    nt = clean_sequence(sequence)
+    nt = clean_sequence(sequence) blast_url = build_blast_url(nt)  # หรือ clean_seq ถ้าคุณใช้ชื่อนั้น
+
+st.markdown("### 🔗 External Analysis")
+st.markdown(f"[👉 Run NCBI BLAST (blastn)]({blast_url})")
+
+    def build_blast_url(sequence: str) -> str:
+    base_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+    params = {
+        "PROGRAM": "blastn",
+        "PAGE_TYPE": "BlastSearch",
+        "QUERY": sequence
+    }
+    return base_url + "?" + urllib.parse.urlencode(params)
+
     if len(nt) == 0:
         st.error("No valid A/T/G/C bases found after cleaning. Please check input.")
         st.stop()
@@ -94,3 +107,4 @@ if st.button("Analyze Sequence"):
 
     st.markdown("### QC Assessment")
     st.write("Status: **Screening complete.**")
+
