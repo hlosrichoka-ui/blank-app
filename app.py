@@ -229,3 +229,11 @@ st.caption(
     "Identity (% of input) = sample ตรงกับ reference กี่ % ของ input ทั้งหมด "
     "(query-centric QC logic)"
 )
+# alignment coordinates in original sequences (0-based half-open)
+ref_blocks = aln.aligned[0]
+qry_blocks = aln.aligned[1]
+
+# convert to 1-based inclusive coordinates (nice for QC report)
+ref_ranges = [(rs+1, re) for rs, re in ref_blocks]
+qry_ranges = [(qs+1, qe) for qs, qe in qry_blocks]
+
