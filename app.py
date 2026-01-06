@@ -1,186 +1,235 @@
-import time
 import re
-import requests
+import io
+import pandas as pd
 import streamlit as st
 from Bio.Seq import Seq
+from Bio.Align import PairwiseAligner
 
-EBI_BASE = "https://www.ebi.ac.uk/Tools/services/rest/ncbiblast"
+# =========================
+# Reference sequences (user-provided)
+# =========================
+HA_REF_LABEL = "Influenza A virus (A/Shanghai/02/2013(H7N9)) segment 4 hemagglutinin (HA) gene"
+NA_REF_LABEL = "Influenza A virus (A/Shanghai/02/2013(H7N9)) segment 6 neuraminidase (NA) gene"
+SUBTYPE_LABEL = "H7N9"
+ORGANISM_LABEL = "Influenza A virus (A/Shanghai/02/2013(H7N9))"
 
-st.set_page_config(page_title="HA/NA Quick-Check (EBI BLAST)")
-st.title("HA/NA Sequence Identity Quick-Check (QC) — EBI BLAST")
+HA_REF_RAW = """ATGAACACTCAAATCCTGGTATTCGCTCTGATTGCGATCATTCCAACAAATGCAGACAAAATCTGCCTCG
+GACATCATGCCGTGTCAAACGGAACCAAAGTAAACACATTAACTGAAAGAGGAGTGGAAGTCGTCAATGC
+AACTGAAACAGTGGAACGAACAAACATCCCCAGGATCTGCTCAAAAGGGAAAAGGACAGTTGACCTCGGT
+CAATGTGGACTCCTGGGGACAATCACTGGACCACCTCAATGTGACCAATTCCTAGAATTTTCAGCCGATT
+TAATTATTGAGAGGCGAGAAGGAAGTGATGTCTGTTATCCTGGGAAATTCGTGAATGAAGAAGCTCTGAG
+GCAAATTCTCAGAGAATCAGGCGGAATTGACAAGGAAGCAATGGGATTCACATACAGTGGAATAAGAACT
+AATGGAGCAACCAGTGCATGTAGGAGATCAGGATCTTCATTCTATGCAGAAATGAAATGGCTCCTGTCAA
+ACACAGATAATGCTGCATTCCCGCAGATGACTAAGTCATATAAAAATACAAGAAAAAGCCCAGCTCTAAT
+AGTATGGGGGATCCATCATTCCGTATCAACTGCAGAGCAAACCAAGCTATATGGGAGTGGAAACAAACTG
+GTGACAGTTGGGAGTTCTAATTATCAACAATCTTTTGTACCGAGTCCAGGAGCGAGACCACAAGTTAATG
+GTCTATCTGGAAGAATTGACTTTCATTGGCTAATGCTAAATCCCAATGATACAGTCACTTTCAGTTTCAA
+TGGGGCTTTCATAGCTCCAGACCGTGCAAGCTTCCTGAGAGGAAAATCTATGGGAATCCAGAGTGGAGTA
+CAGGTTGATGCCAATTGTGAAGGGGACTGCTATCATAGTGGAGGGACAATAATAAGTAACTTGCCATTTC
+AGAACATAGATAGCAGGGCAGTTGGAAAATGTCCGAGATATGTTAAGCAAAGGAGTCTGCTGCTAGCAAC
+AGGGATGAAGAATGTTCCTGAGATTCCAAAAGGAAGAGGCCTATTTGGTGCTATAGCGGGTTTCATTGAA
+AATGGATGGGAAGGCCTAATTGATGGTTGGTATGGTTTCAGACACCAGAATGCACAGGGAGAGGGAACTG
+CTGCAGATTACAAAAGCACTCAATCGGCAATTGATCAAATAACAGGAAAATTAAACCGGCTTATAGAAAA
+AACCAACCAACAATTTGAGTTGATAGACAATGAATTCAATGAGGTAGAGAAGCAAATCGGTAATGTGATA
+AATTGGACCAGAGATTCTATAACAGAAGTGTGGTCATACAATGCTGAACTCTTGGTAGCAATGGAGAACC
+AGCATACAATTGATCTGGCTGATTCAGAAATGGACAAACTGTACGAACGAGTGAAAAGACAGCTGAGAGA
+GAATGCTGAAGAAGATGGCACTGGTTGCTTTGAAATATTTCACAAGTGTGATGATGACTGTATGGCCAGT
+ATTAGAAATAACACCTATGATCACAGCAAATACAGGGAAGAGGCAATGCAAAATAGAATACAGATTGACC
+CAGTCAAACTAAGCAGCGGCTACAAAGATGTGATACTTTGGTTTAGCTTCGGGGCATCATGTTTCATACT
+TCTAGCCATTGTAATGGGCCTTGTCTTCATATGTGTAAAGAATGGAAACATGCGGTGCACTATTTGTATA
+TAA"""
 
-# --- Inputs ---
-email = st.text_input("Email (required by EBI fair-use policy)", placeholder="your.name@org.com")
+NA_REF_RAW = """ATGAATCCAAATCAGAAGATTCTATGCACTTCAGCCACTGCTATCATAATAGGCGCAATCGCAGTACTCA
+TTGGAATGGCAAACCTAGGATTGAACATAGGACTGCATCTAAAACCGGGCTGCAATTGCTCACACTCACA
+ACCTGAAACAACCAACACAAGCCAAACAATAATAAACAACTATTATAATGAAACAAACATCACCAAYATC
+CAAATGGAAGAGAGAACAAGCAGGAATTTCAATAACTTAACTAAAGGGCTCTGTACTATAAATTCATGGC
+ACATATATGGGAAAGACAATGCAGTAAGAATTGGAGAGAGCTCGGATGTTTTAGTCACAAGAGAACCCTA
+TGTTTCATGCGACCCAGATGAATGCAGGTTCTATGCTCTCAGCCAAGGAACAACAATCAGAGGGAAACAC
+TCAAACGGAACAATACACGATAGGTCCCAGTATCGCGCCCTGATAAGCTGGCCACTATCATCACCGCCCA
+CAGTGTACAACAGCAGGGTGGAATGCATTGGGTGGTCAAGTACTAGTTGCCATGATGGCAAATCCAGGAT
+GTCAATATGTATATCAGGACCAAACAACAATGCATCTGCAGTAGTATGGTACAACAGAAGGCCTGTTGCA
+GAAATTAACACATGGGCCCGAAACATACTAAGAACACAGGAATCTGAATGTGTATGCCACAACGGCGTAT
+GCCCAGTAGTGTTCACCGATGGGTCTGCCACTGGACCTGCAGACACAAGAATATACTATTTTAAAGAGGG
+GAAAATATTGAAATGGGAGTCTCTGACTGGAACTGCTAAGCATATTGAAGAATGCTCATGTTACGGGGAA
+CGAACAGGAATTACCTGCACATGCAGGGACAATTGGCAGGGCTCAAATAGACCAGTGATTCAGATAGACC
+CAGTAGCAATGACACACACTAGTCAATATATATGCAGTCCTGTTCTTACAGACAATCCCCGACCGAATGA
+CCCAAATATAGGTAAGTGTAATGACCCTTATCCAGGTAATAATAACAATGGAGTCAAGGGATTCTCATAC
+CTGGATGGGGCTAACACTTGGCTAGGGAGGACAATAAGCACAGCCTCGAGGTCTGGATACGAGATGTTAA
+AAGTGCCAAATGCATTGACAGATGATAGATCAAAGCCCATTCAAGGTCAGACAATTGTATTAAACGCTGA
+CTGGAGTGGTTACAGTGGATCTTTCATGGACTATTGGGCTGAAGGGGACTGCTATCGAGCGTGTTTTTAT
+GTGGAGTTGATACGTGGAAGACCCAAGGAGGATAAAGTGTGGTGGACCAGCAATAGTATAGTATCGATGT
+GTTCCAGTACAGAATTCCTGGGACAATGGAACTGGCCTGATGGGGCTAAAATAGAGTACTTCCTCTAA"""
+
+# =========================
+# Helpers
+# =========================
+def clean_nt(seq: str) -> str:
+    lines = [l.strip() for l in seq.splitlines() if l.strip() and not l.strip().startswith(">")]
+    joined = "".join(lines)
+    # keep only ATGC (drop IUPAC ambiguity like Y)
+    return re.sub(r"[^ATGCatgc]", "", joined).upper()
+
+def gc_content(seq: str) -> float:
+    if not seq:
+        return 0.0
+    return 100.0 * (seq.count("G") + seq.count("C")) / len(seq)
+
+def translate_frame(nt: str, frame: int) -> str:
+    trimmed = nt[frame:]
+    trimmed = trimmed[: (len(trimmed) // 3) * 3]
+    if not trimmed:
+        return ""
+    return str(Seq(trimmed).translate(to_stop=False))
+
+def best_orf_6frames(nt: str):
+    candidates = []
+    fwd = nt
+    rev = str(Seq(nt).reverse_complement())
+    for strand, seq in [("forward", fwd), ("reverse_complement", rev)]:
+        for frame in [0, 1, 2]:
+            aa = translate_frame(seq, frame)
+            pre = aa.split("*")[0] if aa else ""
+            candidates.append({
+                "strand": strand,
+                "frame": frame + 1,
+                "aa": aa,
+                "aa_len_before_stop": len(pre),
+                "stop_count": aa.count("*") if aa else 0,
+            })
+    best = sorted(
+        candidates,
+        key=lambda x: (x["aa_len_before_stop"], -x["stop_count"]),
+        reverse=True
+    )[0]
+    return best
+
+def align_and_score(ref: str, qry: str):
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -3
+    aligner.extend_gap_score = -0.5
+
+    aln = next(iter(aligner.align(ref, qry)))
+    lines = aln.format().splitlines()
+    ref_aln = lines[0].replace(" ", "")
+    qry_aln = lines[2].replace(" ", "")
+
+    # identity over query aligned bases (non-gap in query)
+    matches = 0
+    aligned_q = 0
+    for r, q in zip(ref_aln, qry_aln):
+        if q != "-":
+            aligned_q += 1
+            if r == q:
+                matches += 1
+
+    identity = (matches / aligned_q * 100) if aligned_q else 0.0
+    coverage = (aligned_q / len(qry) * 100) if len(qry) else 0.0
+    return identity, coverage
+
+# =========================
+# App UI (matching your layout)
+# =========================
+st.subheader("HA/NA Sequence Identity Quick-Check")
+
 sample_id = st.text_input("Sample ID")
 expected_gene = st.radio("Expected Gene", ["HA", "NA"], horizontal=True)
 
-blast_program = st.selectbox(
-    "BLAST program",
-    ["blastn", "tblastx", "blastx", "tblastn", "blastp"],
-    index=0
-)
+query_raw = st.text_area("Paste Nucleotide Sequence (FASTA):", height=220)
 
-# For nucleotide HA/NA quick-check, ENA coding sequences is a reasonable start.
-# (You can change to other EM_* or UniProt options later.)
-database = st.selectbox(
-    "Database",
-    [
-        "EM_CDS",     # ENA coding sequences
-        "EM_NCS",     # ENA non-coding
-        "EM_RRNA",    # ENA rRNA
-        "UNIPROT",    # UniProtKB
-        "SP",         # SwissProt
-        "TR",         # TrEMBL
-        "UniVec"      # vectors
-    ],
-    index=0
-)
+# Thresholds (QC rule) – can adjust
+IDENTITY_PASS = 95.0
+COVERAGE_PASS = 90.0
 
-sequence = st.text_area(
-    "Paste nucleotide/protein sequence (FASTA or raw):",
-    height=220
-)
-
-max_wait_seconds = st.slider("Max wait for BLAST (seconds)", 20, 180, 60, 10)
-
-# --- Helpers ---
-def clean_sequence(seq: str) -> str:
-    # keep only letters + fasta header stripping
-    seq = re.sub(r">.*\n", "", seq)
-    return re.sub(r"[^A-Za-z]", "", seq).upper()
-
-def ebi_post_run(email: str, program: str, database: str, stype: str, seq: str) -> str:
-    # EBI REST: POST /run with form fields
-    r = requests.post(
-        f"{EBI_BASE}/run",
-        data={
-            "email": email,
-            "program": program,
-            "database": database,
-            "stype": stype,
-            "sequence": seq,
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.text.strip()  # jobId
-
-def ebi_get_status(jobid: str) -> str:
-    r = requests.get(f"{EBI_BASE}/status/{jobid}", timeout=30)
-    r.raise_for_status()
-    return r.text.strip()
-
-def ebi_get_result(jobid: str, rtype: str) -> str:
-    r = requests.get(f"{EBI_BASE}/result/{jobid}/{rtype}", timeout=120)
-    r.raise_for_status()
-    return r.text
-
-def guess_gene_from_blast_out(blast_out: str) -> str:
-    u = blast_out.upper()
-    if "HEMAGGLUTININ" in u or " HA " in u:
-        return "HA"
-    if "NEURAMINIDASE" in u or " NA " in u:
-        return "NA"
-    return "Unknown"
-
-def qc_orf_check_if_nt(nt_seq: str) -> str:
-    # very rough ORF sanity check: translate 3 frames and see if many stops
-    # For QC quick-check only (NOT a validation claim)
-    stops = []
-    for frame in [0, 1, 2]:
-        aa = str(Seq(nt_seq[frame:]).translate(to_stop=False))
-        stops.append(aa.count("*"))
-    return f"Frame stop counts: {stops} (lower is better)"
-
-# --- UI ---
-if st.button("Run EBI BLAST and Analyze"):
-    if not email:
-        st.error("Please provide email (required by EBI).")
-        st.stop()
-    if not sequence.strip():
-        st.error("Please paste a sequence.")
+if st.button("Analyze Sequence", type="primary"):
+    Q = clean_nt(query_raw)
+    if not Q:
+        st.error("Please paste a valid nucleotide sequence (A/T/G/C).")
         st.stop()
 
-    clean_seq = clean_sequence(sequence)
-    if len(clean_seq) < 50:
-        st.warning("Sequence looks very short (<50 bp/aa). BLAST may be uninformative.")
+    ha_ref = clean_nt(HA_REF_RAW)
+    na_ref = clean_nt(NA_REF_RAW)
 
-    # Guess sequence type for EBI 'stype'
-    # blastn usually expects dna; blastp expects protein.
-    if blast_program == "blastp":
-        stype = "protein"
+    # Compare to refs
+    ha_id, ha_cov = align_and_score(ha_ref, Q)
+    na_id, na_cov = align_and_score(na_ref, Q)
+
+    # Decide gene by better (identity, coverage)
+    if (ha_id, ha_cov) >= (na_id, na_cov):
+        gene_identified = "HA"
+        best_identity = ha_id
+        best_coverage = ha_cov
+        gene_label = HA_REF_LABEL
     else:
-        stype = "dna"
+        gene_identified = "NA"
+        best_identity = na_id
+        best_coverage = na_cov
+        gene_label = NA_REF_LABEL
 
-    st.info(f"Submitting job to EBI BLAST: program={blast_program}, database={database}, stype={stype}")
+    # ORF check (heuristic)
+    best_orf = best_orf_6frames(Q)
+    orf_investigate = (best_orf["aa_len_before_stop"] < 80) or (best_orf["stop_count"] > 1)
+    orf_status = "PASS" if not orf_investigate else "INVESTIGATE"
 
-    try:
-        jobid = ebi_post_run(email=email, program=blast_program, database=database, stype=stype, seq=clean_seq)
-    except Exception as e:
-        st.error(f"Submit failed: {e}")
-        st.stop()
+    # Critical mutation (Phase 1 placeholder)
+    critical_mutation = "None (not assessed in Phase 1)"
 
-    st.success(f"Job submitted. JobID: {jobid}")
-
-    # Poll status
-    with st.spinner("Waiting for EBI BLAST to finish..."):
-        start = time.time()
-        status = "RUNNING"
-        while time.time() - start < max_wait_seconds:
-            try:
-                status = ebi_get_status(jobid)
-            except Exception as e:
-                st.warning(f"Status check issue: {e}")
-                time.sleep(3)
-                continue
-
-            if status in ["FINISHED", "ERROR", "FAILURE", "NOT_FOUND"]:
-                break
-            time.sleep(3)
-
-    st.write(f"Job status: **{status}**")
-
-    if status != "FINISHED":
-        st.error("BLAST did not finish within the wait time (or returned an error).")
-        st.caption("Tip: increase max wait time, or try again later. Results are typically stored for limited time on the service.")
-        st.stop()
-
-    # Fetch results
-    try:
-        out_txt = ebi_get_result(jobid, "out")   # main BLAST text output
-    except Exception as e:
-        st.error(f"Failed to fetch BLAST output (out): {e}")
-        st.stop()
-
-    # Optional: fetch hit IDs
-    ids_txt = ""
-    try:
-        ids_txt = ebi_get_result(jobid, "ids")
-    except Exception:
-        pass
-
-    st.subheader("🔍 Quick QC Summary")
-    st.write(f"Sample ID: **{sample_id or '-'}**")
-    st.write(f"Expected gene: **{expected_gene}**")
-    if stype == "dna":
-        st.write(qc_orf_check_if_nt(clean_seq))
-
-    gene_guess = guess_gene_from_blast_out(out_txt)
-    st.write(f"Gene identified (heuristic from BLAST text): **{gene_guess}**")
-
-    if gene_guess != "Unknown" and gene_guess != expected_gene:
-        st.error("QC Assessment: ❌ FAIL (Gene mismatch vs expected)")
+    # QC assessment rule
+    # Fail if gene mismatch vs expected OR if identity/coverage below thresholds
+    if gene_identified != expected_gene:
+        qc_assessment = "❌ FAIL (Gene mismatch)"
+        qc_ok = False
+    elif best_identity < IDENTITY_PASS or best_coverage < COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low identity/coverage)"
+        qc_ok = False
+    elif orf_investigate:
+        qc_assessment = "⚠️ INVESTIGATE (ORF check)"
+        qc_ok = False
     else:
-        st.success("QC Assessment: ✅ OK (No obvious gene mismatch from BLAST text)")
+        qc_assessment = "✅ PASS"
+        qc_ok = True
 
-    if ids_txt:
-        st.markdown("### Top hit IDs (from EBI)")
-        st.code("\n".join(ids_txt.strip().splitlines()[:10]))
+    # ---- Display results (as requested) ----
+    st.markdown("---")
+    st.subheader("🔍 Analysis Result")
+    st.write(f"**Organism:** {ORGANISM_LABEL}")
+    st.write(f"**Gene Identified:** {gene_identified}  —  ({gene_label})")
+    st.write(f"**Subtype:** {SUBTYPE_LABEL}")
+    st.write(f"**Identity (%):** {best_identity:.2f}")
+    st.write(f"**Coverage (%):** {best_coverage:.2f}")
+    st.write(f"**ORF Check:** {orf_status}")
+    st.write(f"**Critical Mutation:** {critical_mutation}")
+    st.markdown(f"### QC Assessment: {qc_assessment}")
 
-    st.markdown("### BLAST Output (text)")
-    st.text_area("EBI BLAST out", out_txt, height=350)
+    # ---- Download report (CSV) ----
+    report = pd.DataFrame([{
+        "Sample ID": sample_id,
+        "Expected Gene": expected_gene,
+        "Gene Identified": gene_identified,
+        "Subtype": SUBTYPE_LABEL,
+        "Identity (%)": round(best_identity, 2),
+        "Coverage (%)": round(best_coverage, 2),
+        "ORF Check": orf_status,
+        "Critical Mutation": critical_mutation,
+        "QC Assessment": qc_assessment,
+        "Reference (HA)": HA_REF_LABEL,
+        "Reference (NA)": NA_REF_LABEL
+    }])
 
-    st.caption(
-        "Notes: This app uses EMBL-EBI Job Dispatcher (NCBI BLAST+) REST endpoints. "
-        "Provide a valid email and avoid high-volume submissions per fair-use."
+    csv_bytes = report.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download QC Report (CSV)",
+        data=csv_bytes,
+        file_name=f"{sample_id or 'qc_report'}_HA_NA_identity.csv",
+        mime="text/csv"
     )
+
+    # Optional: show thresholds used
+    with st.expander("Show QC thresholds used"):
+        st.write(f"Identity PASS threshold: {IDENTITY_PASS}%")
+        st.write(f"Coverage PASS threshold: {COVERAGE_PASS}%")
+        st.write("ORF investigate rule: best frame AA before first stop < 80 OR stop_count > 1")
+
+st.caption("QC note: This tool compares only to the provided HA/NA references and is intended for screening/supporting evidence.")
