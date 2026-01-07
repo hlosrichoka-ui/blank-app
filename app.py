@@ -8,7 +8,7 @@ from Bio.Align import PairwiseAligner
 # Page config
 # =========================================================
 st.set_page_config(page_title="HA/NA Sequence Identity Quick-Check", layout="centered")
-st.title("HA/NA Sequence Identity Quick-Check")
+st.title("HA/NA Sequence Identity Quick-Check (BLAST-like)")
 
 # =========================================================
 # Reference information
@@ -70,16 +70,18 @@ GTGGAGTTGATACGTGGAAGACCCAAGGAGGATAAAGTGTGGTGGACCAGCAATAGTATAGTATCGATGT
 GTTCCAGTACAGAATTCCTGGGACAATGGAACTGGCCTGATGGGGCTAAAATAGAGTACTTCCTCTAA"""
 
 # =========================================================
-# Helper functions
+# Helpers
 # =========================================================
 def clean_nt(seq: str) -> str:
-    """Remove FASTA headers and keep only A/T/G/C. Drops ambiguity codes (e.g., Y)."""
+    """Remove FASTA headers and keep only A/T/G/C. Drops ambiguity codes."""
     lines = [l.strip() for l in seq.splitlines() if l.strip() and not l.strip().startswith(">")]
     joined = "".join(lines)
     return re.sub(r"[^ATGCatgc]", "", joined).upper()
 
+def reverse_complement(seq: str) -> str:
+    return str(Seq(seq).reverse_complement())
+
 def best_orf_6frames(nt: str):
-    """Simple ORF sanity check: longest AA before first stop across 6 frames."""
     fwd = nt
     rev = str(Seq(nt).reverse_complement())
     best_len = 0
@@ -97,93 +99,10 @@ def best_orf_6frames(nt: str):
                 best_stop = aa.count("*")
     return best_len, best_stop
 
-def query_centric_local_compare(ref: str, qry: str):
-    """
-    LOCAL alignment: finds best matching region (does NOT need to start at first base).
-
-    QUERY-centric metrics:
-      Identity (% of input)        = matches / len(query) * 100
-      Identity (% aligned region)  = matches / aligned_query_bases * 100
-      Coverage (% of input aligned)= aligned_query_bases / len(query) * 100
-
-    Also returns:
-      mismatch_positions_abs (1-based on query)
-      uncovered_positions_abs (1-based on query)
-      ref_ranges (1-based inclusive): list of (start,end) for aligned blocks on REF
-      qry_ranges (1-based inclusive): list of (start,end) for aligned blocks on QUERY
-    """
-    aligner = PairwiseAligner()
-    aligner.mode = "local"  # ✅ important: local alignment
-    aligner.match_score = 2
-    aligner.mismatch_score = -1
-    aligner.open_gap_score = -3
-    aligner.extend_gap_score = -0.5
-
-    aln = next(iter(aligner.align(ref, qry)))
-
-    ref_blocks = aln.aligned[0]
-    qry_blocks = aln.aligned[1]
-
-    total_query = len(qry)
-
-    # Robust empty-check across Biopython/NumPy behaviors
-    if qry_blocks is None or len(qry_blocks) == 0:
-        uncovered = list(range(1, total_query + 1))
-        return 0.0, 0.0, 0.0, [], uncovered, 0, 0, [], []
-
-    # 1-based inclusive ranges for reporting
-    ref_ranges = [(int(rs) + 1, int(re)) for rs, re in ref_blocks]
-    qry_ranges = [(int(qs) + 1, int(qe)) for qs, qe in qry_blocks]
-
-    # Covered query positions (1-based)
-    covered = set()
-    for qs, qe in qry_blocks:
-        for p in range(int(qs) + 1, int(qe) + 1):
-            covered.add(p)
-
-    uncovered = [p for p in range(1, total_query + 1) if p not in covered]
-
-    # Alignment strings for mismatch detection
-    lines = aln.format().splitlines()
-    ref_aln = lines[0].replace(" ", "")
-    qry_aln = lines[2].replace(" ", "")
-
-    covered_sorted = sorted(covered)
-    idx = 0
-
-    matches = 0
-    aligned_query_bases = 0
-    mismatch_abs = []
-
-    for r, q in zip(ref_aln, qry_aln):
-        if q == "-":
-            continue
-        if idx >= len(covered_sorted):
-            break
-        q_abs = covered_sorted[idx]
-        idx += 1
-
-        aligned_query_bases += 1
-        if r == q:
-            matches += 1
-        else:
-            mismatch_abs.append(q_abs)
-
-    identity_input = (matches / total_query * 100) if total_query else 0.0
-    identity_aligned = (matches / aligned_query_bases * 100) if aligned_query_bases else 0.0
-    coverage_input = (aligned_query_bases / total_query * 100) if total_query else 0.0
-
-    return (
-        identity_input,
-        identity_aligned,
-        coverage_input,
-        mismatch_abs,
-        uncovered,
-        matches,
-        aligned_query_bases,
-        ref_ranges,
-        qry_ranges,
-    )
+def ranges_to_text(ranges):
+    if not ranges:
+        return "-"
+    return ", ".join([f"{s}-{e}" for s, e in ranges])
 
 def annotate_sequence(query: str, mismatch_positions: list, uncovered_positions: list, width: int = 60) -> str:
     """
@@ -205,21 +124,127 @@ def annotate_sequence(query: str, mismatch_positions: list, uncovered_positions:
     blocks = ["".join(out[i:i+width]) for i in range(0, len(out), width)]
     return "\n".join(blocks)
 
-def ranges_to_text(ranges):
-    """Pretty print list of (start,end) ranges."""
-    if not ranges:
-        return "-"
-    return ", ".join([f"{s}-{e}" for s, e in ranges])
+def local_align_blastlike(ref: str, qry: str):
+    """
+    LOCAL alignment (BLAST-like HSP behavior).
+    Returns BOTH:
+      - Query-centric metrics (identity over input, coverage over input)
+      - BLAST-like metrics (Identities X/Y, Gaps g/Y, %Identity over alignment length)
+
+    Output tuple:
+      identity_input_pct,
+      identity_aligned_pct (matches / aligned query bases),
+      coverage_input_pct,
+      mismatch_positions_abs (1-based on query),
+      uncovered_positions_abs (1-based on query),
+      matches (X),
+      aligned_query_bases,
+      ref_ranges (1-based inclusive),
+      qry_ranges (1-based inclusive),
+      aln_length (Y; includes gaps),
+      gaps_total (g; '-' in either aligned string),
+      identity_alnlen_pct (X/Y * 100),
+      gaps_pct (g/Y * 100)
+    """
+    aligner = PairwiseAligner()
+    aligner.mode = "local"
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -3
+    aligner.extend_gap_score = -0.5
+
+    aln = next(iter(aligner.align(ref, qry)))
+
+    ref_blocks = aln.aligned[0]
+    qry_blocks = aln.aligned[1]
+    total_query = len(qry)
+
+    if qry_blocks is None or len(qry_blocks) == 0:
+        uncovered = list(range(1, total_query + 1))
+        return (0.0, 0.0, 0.0, [], uncovered, 0, 0, [], [], 0, 0, 0.0, 0.0)
+
+    # 1-based inclusive ranges for reporting
+    ref_ranges = [(int(rs) + 1, int(re)) for rs, re in ref_blocks]
+    qry_ranges = [(int(qs) + 1, int(qe)) for qs, qe in qry_blocks]
+
+    # Covered query positions (1-based)
+    covered = set()
+    for qs, qe in qry_blocks:
+        for p in range(int(qs) + 1, int(qe) + 1):
+            covered.add(p)
+    uncovered = [p for p in range(1, total_query + 1) if p not in covered]
+
+    # Alignment strings
+    lines = aln.format().splitlines()
+    ref_aln = lines[0].replace(" ", "")
+    qry_aln = lines[2].replace(" ", "")
+
+    aln_length = len(ref_aln)  # includes gaps (BLAST "Length" for HSP)
+    gaps_total = ref_aln.count("-") + qry_aln.count("-")
+    gaps_pct = (gaps_total / aln_length * 100) if aln_length else 0.0
+
+    # Map mismatch positions to absolute query coordinates (1-based)
+    covered_sorted = sorted(covered)
+    idx = 0
+
+    matches = 0  # identities X
+    aligned_query_bases = 0  # query letters excluding gaps
+    mismatch_abs = []
+
+    for r, q in zip(ref_aln, qry_aln):
+        if q == "-":
+            continue
+        if idx >= len(covered_sorted):
+            break
+        q_abs = covered_sorted[idx]
+        idx += 1
+
+        aligned_query_bases += 1
+        if r == q and r != "-":
+            matches += 1
+        else:
+            mismatch_abs.append(q_abs)
+
+    identity_input_pct = (matches / total_query * 100) if total_query else 0.0
+    identity_aligned_pct = (matches / aligned_query_bases * 100) if aligned_query_bases else 0.0
+    coverage_input_pct = (aligned_query_bases / total_query * 100) if total_query else 0.0
+
+    identity_alnlen_pct = (matches / aln_length * 100) if aln_length else 0.0
+
+    return (
+        identity_input_pct,
+        identity_aligned_pct,
+        coverage_input_pct,
+        mismatch_abs,
+        uncovered,
+        matches,
+        aligned_query_bases,
+        ref_ranges,
+        qry_ranges,
+        aln_length,
+        gaps_total,
+        identity_alnlen_pct,
+        gaps_pct,
+    )
+
+def pick_best(res_a, res_b):
+    """
+    Pick best result BLAST-like:
+      1) highest identity over alignment length (X/Y)
+      2) then longer alignment length (Y)
+    """
+    # res[11]=identity_alnlen_pct, res[9]=aln_length
+    return res_a if (res_a[11], res_a[9]) >= (res_b[11], res_b[9]) else res_b
 
 # =========================================================
-# UI (inputs)
+# UI
 # =========================================================
 sample_id = st.text_input("Sample ID")
 expected_gene = st.radio("Expected Gene", ["HA", "NA"], horizontal=True)
 query_raw = st.text_area("Paste Nucleotide Sequence (FASTA):", height=220)
 
-# QC thresholds (adjust to your SOP)
-IDENTITY_PASS = st.number_input("Identity PASS threshold (% of input)", value=95.0, step=0.5)
+# BLAST-like thresholds (you can tighten like 99.0)
+IDENTITY_ALNLEN_PASS = st.number_input("BLAST-like Identity PASS threshold (% of alignment length)", value=99.0, step=0.1)
 COVERAGE_PASS = st.number_input("Coverage PASS threshold (% of input aligned)", value=90.0, step=1.0)
 
 show_positions = st.checkbox("Show mismatch/uncovered positions", value=True)
@@ -238,29 +263,59 @@ if st.button("Analyze Sequence", type="primary"):
     HA_REF = clean_nt(HA_REF_RAW)
     NA_REF = clean_nt(NA_REF_RAW)
 
-    ha = query_centric_local_compare(HA_REF, Q)
-    na = query_centric_local_compare(NA_REF, Q)
+    # Evaluate BOTH strands (sense + antisense) to support A-T / C-G pairing concept
+    Q_rc = reverse_complement(Q)
 
-    # Choose best gene by (Identity % of input, then Coverage % of input)
-    if (ha[0], ha[2]) >= (na[0], na[2]):
+    # HA
+    ha_sense = local_align_blastlike(HA_REF, Q)
+    ha_anti = local_align_blastlike(HA_REF, Q_rc)
+    ha_best = pick_best(ha_sense, ha_anti)
+    ha_strand = "antisense (reverse-complement)" if ha_best == ha_anti else "sense"
+
+    # NA
+    na_sense = local_align_blastlike(NA_REF, Q)
+    na_anti = local_align_blastlike(NA_REF, Q_rc)
+    na_best = pick_best(na_sense, na_anti)
+    na_strand = "antisense (reverse-complement)" if na_best == na_anti else "sense"
+
+    # Choose HA vs NA (BLAST-like)
+    if (ha_best[11], ha_best[9]) >= (na_best[11], na_best[9]):
         gene_identified = "HA"
         gene_label = HA_REF_LABEL
-        identity_input, identity_aligned, coverage_input, mismatch_pos, uncovered_pos, matches, aligned_bases, ref_ranges, qry_ranges = ha
+        strand_used = ha_strand
+        res = ha_best
     else:
         gene_identified = "NA"
         gene_label = NA_REF_LABEL
-        identity_input, identity_aligned, coverage_input, mismatch_pos, uncovered_pos, matches, aligned_bases, ref_ranges, qry_ranges = na
+        strand_used = na_strand
+        res = na_best
 
-    # ORF check
+    (
+        identity_input_pct,
+        identity_aligned_pct,
+        coverage_input_pct,
+        mismatch_pos,
+        uncovered_pos,
+        matches_X,
+        aligned_query_bases,
+        ref_ranges,
+        qry_ranges,
+        aln_length_Y,
+        gaps_g,
+        identity_alnlen_pct,
+        gaps_pct,
+    ) = res
+
+    # ORF check (on original cleaned input strand)
     best_len, stop_count = best_orf_6frames(Q)
     orf_status = "PASS" if (best_len >= 80 and stop_count <= 1) else "INVESTIGATE"
 
-    # QC Assessment
+    # QC Assessment (BLAST-like)
     if gene_identified != expected_gene:
         qc_assessment = "❌ FAIL (Gene mismatch)"
         qc_flag = "FAIL"
-    elif identity_input < IDENTITY_PASS or coverage_input < COVERAGE_PASS:
-        qc_assessment = "⚠️ INVESTIGATE (Low identity/coverage vs thresholds)"
+    elif identity_alnlen_pct < IDENTITY_ALNLEN_PASS or coverage_input_pct < COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low BLAST-like identity / coverage)"
         qc_flag = "INVESTIGATE"
     elif orf_status != "PASS":
         qc_assessment = "⚠️ INVESTIGATE (ORF check)"
@@ -273,65 +328,53 @@ if st.button("Analyze Sequence", type="primary"):
     # Display results
     # =====================================================
     st.markdown("---")
-    st.subheader("🔍 Analysis Result")
+    st.subheader("🔍 Analysis Result (BLAST-like)")
     st.write(f"**Sample ID:** {sample_id if sample_id else '-'}")
     st.write(f"**Organism:** {ORGANISM_LABEL}")
     st.write(f"**Gene Identified:** {gene_identified} — ({gene_label})")
     st.write(f"**Subtype:** {SUBTYPE_LABEL}")
+    st.write(f"**Strand used:** {strand_used}")
 
-    st.write(f"**Identity (% of input):** {identity_input:.2f}")
-    st.caption("= sample ตรงกับ reference กี่ % ของ input ทั้งหมด (นับส่วนที่ไม่ align เป็น non-match)")
+    # BLAST-like lines
+    st.write(f"**Identities:** {matches_X}/{aln_length_Y} ({identity_alnlen_pct:.2f}%)")
+    st.write(f"**Gaps:** {gaps_g}/{aln_length_Y} ({gaps_pct:.2f}%)")
+    st.write(f"**Alignment length (bp):** {aln_length_Y}")
 
-    st.write(f"**Identity (% of aligned region):** {identity_aligned:.2f}")
-    st.caption("= ตรงกันกี่ % เฉพาะส่วนที่ align ได้ (BLAST-like)")
-
-    st.write(f"**Coverage (% of input aligned):** {coverage_input:.2f}")
+    # Also show QC-friendly query-centric summaries
+    st.markdown("#### QC-friendly (query-centric) summaries")
+    st.write(f"**Identity (% of input):** {identity_input_pct:.2f}%")
+    st.write(f"**Identity (% of aligned region; BLAST-like but excludes gap-columns):** {identity_aligned_pct:.2f}%")
+    st.write(f"**Coverage (% of input aligned):** {coverage_input_pct:.2f}%")
     st.write(f"**ORF Check:** {orf_status}")
 
     st.markdown(f"### QC Assessment: {qc_assessment}")
 
     # =====================================================
-    # Alignment position ranges (start/end)
+    # Alignment ranges
     # =====================================================
     if show_ranges:
         with st.expander("Aligned start/end positions (LOCAL alignment; not necessarily from first base)"):
-            st.write("**INPUT (query) aligned ranges (1-based):**", ranges_to_text(qry_ranges))
+            st.write("**INPUT aligned ranges (1-based):**", ranges_to_text(qry_ranges))
             st.write("**REF aligned ranges (1-based):**", ranges_to_text(ref_ranges))
-            st.caption("Note: local alignment finds the best matching region(s); alignment does not need to start at position 1.")
 
     # =====================================================
-    # QC traceability breakdown
-    # =====================================================
-    with st.expander("Show query-centric breakdown (traceability)"):
-        st.write(f"Input length: **{len(Q)} bp**")
-        st.write(f"Aligned input bases (coverage numerator): **{aligned_bases} / {len(Q)}**")
-        st.write(f"Matched bases (counted toward Identity % of input): **{matches} / {len(Q)}**")
-        st.write(f"Mismatch count (aligned but different): **{len(mismatch_pos)}**")
-        st.write(f"Uncovered count (not aligned to ref): **{len(uncovered_pos)}**")
-
-    # =====================================================
-    # Highlight mismatch / uncovered positions + annotated sequence
+    # Positions and annotated sequence
     # =====================================================
     if show_positions:
         with st.expander("Mismatch / Uncovered positions (1-based on INPUT)"):
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("#### Mismatch positions (aligned but not equal)")
+                st.write("None" if not mismatch_pos else f"Total: {len(mismatch_pos)}")
                 if mismatch_pos:
-                    st.write(f"Total mismatches: **{len(mismatch_pos)}**")
                     st.code(", ".join(map(str, mismatch_pos)))
-                else:
-                    st.write("None")
-
             with col2:
                 st.markdown("#### Uncovered positions (no alignment to ref)")
+                st.write("None" if not uncovered_pos else f"Total: {len(uncovered_pos)}")
                 if uncovered_pos:
-                    st.write(f"Total uncovered: **{len(uncovered_pos)}**")
                     preview = uncovered_pos[:200]
-                    tail_note = "" if len(uncovered_pos) <= 200 else f"\n... (+{len(uncovered_pos)-200} more)"
-                    st.code(", ".join(map(str, preview)) + tail_note)
-                else:
-                    st.write("None")
+                    tail = "" if len(uncovered_pos) <= 200 else f"\n... (+{len(uncovered_pos)-200} more)"
+                    st.code(", ".join(map(str, preview)) + tail)
 
     if show_annotated:
         with st.expander("Annotated input sequence (UPPERCASE=match, lowercase=mismatch, N=uncovered)"):
@@ -345,18 +388,29 @@ if st.button("Analyze Sequence", type="primary"):
         "Expected Gene": expected_gene,
         "Gene Identified": gene_identified,
         "Subtype": SUBTYPE_LABEL,
-        "Identity (% of input)": round(identity_input, 2),
-        "Identity (% of aligned region)": round(identity_aligned, 2),
-        "Coverage (% of input aligned)": round(coverage_input, 2),
-        "Input length (bp)": len(Q),
-        "Aligned input bases": aligned_bases,
-        "Matched bases": matches,
-        "Mismatch count": len(mismatch_pos),
-        "Uncovered count": len(uncovered_pos),
+        "Strand used": strand_used,
+
+        "Identities (X)": matches_X,
+        "Alignment length (Y)": aln_length_Y,
+        "BLAST-like Identity (% X/Y)": round(identity_alnlen_pct, 2),
+
+        "Gaps (g)": gaps_g,
+        "Gaps (% g/Y)": round(gaps_pct, 2),
+
+        "Identity (% of input)": round(identity_input_pct, 2),
+        "Identity (% of aligned region)": round(identity_aligned_pct, 2),
+        "Coverage (% of input aligned)": round(coverage_input_pct, 2),
+
+        "Aligned query bases (no gaps)": aligned_query_bases,
+
         "INPUT aligned ranges (1-based)": ranges_to_text(qry_ranges),
         "REF aligned ranges (1-based)": ranges_to_text(ref_ranges),
+
+        "Mismatch count": len(mismatch_pos),
+        "Uncovered count": len(uncovered_pos),
         "Mismatch positions (1-based input)": ";".join(map(str, mismatch_pos)) if mismatch_pos else "",
         "Uncovered positions (1-based input)": ";".join(map(str, uncovered_pos)) if uncovered_pos else "",
+
         "ORF Check": orf_status,
         "QC Flag": qc_flag,
         "QC Assessment": qc_assessment,
@@ -364,14 +418,14 @@ if st.button("Analyze Sequence", type="primary"):
         "Alignment mode": "local",
     }])
 
-    csv_bytes = report.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download QC Report (CSV)",
-        data=csv_bytes,
-        file_name=f"{sample_id or 'qc_report'}_HA_NA_identity.csv",
+        data=report.to_csv(index=False).encode("utf-8"),
+        file_name=f"{sample_id or 'qc_report'}_HA_NA_blastlike.csv",
         mime="text/csv"
     )
 
 st.caption(
-    "This app uses LOCAL alignment to find the best matching region(s); it does not require matching from the first base."
+    "BLAST-like behavior: LOCAL alignment reports the best matching region (HSP). "
+    "Identities and Gaps are calculated over alignment length (including gap-columns), similar to NCBI BLAST."
 )
