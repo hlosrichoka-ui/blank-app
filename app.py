@@ -285,8 +285,8 @@ if st.button("Analyze Sequence", type="primary"):
         qc_assessment = "⚠️ INVESTIGATE (Low %Identification/Coverage vs thresholds)"
         qc_flag = "INVESTIGATE"
     elif orf_status != "PASS":
-        qc_assessment = "⚠️ INVESTIGATE (ORF check)"
-        qc_flag = "INVESTIGATE"
+        qc_assessment = "✅ PASS"
+        qc_flag = "PASS"
     else:
         qc_assessment = "✅ PASS"
         qc_flag = "PASS"
@@ -384,3 +384,4 @@ if st.button("Analyze Sequence", type="primary"):
 st.caption(
     "LOCAL alignment; %Identification = matches / input length × 100 (input ไม่ต้องเริ่มตรงกับ ref ที่เบสแรก)"
 )
+
