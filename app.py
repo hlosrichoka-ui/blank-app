@@ -66,21 +66,13 @@ IUPAC_TO_N = re.compile(r"[^ACGTNacgtn]")
 
 def clean_nt(seq: str) -> str:
     """
-    Keep A/C/G/T and convert IUPAC ambiguity (e.g., Y, R, K, M, S, W, B, D, H, V) to N.
-    Do NOT delete them (deleting shifts positions and can distort alignment).
+    Keep A/C/G/T; convert IUPAC ambiguity to N (do not delete, to avoid shifting).
     """
     lines = [l.strip() for l in seq.splitlines() if l.strip() and not l.strip().startswith(">")]
-    joined = "".join(lines).replace(" ", "").replace("\t", "")
-    joined = joined.upper()
+    joined = "".join(lines).replace(" ", "").replace("\t", "").upper()
     joined = IUPAC_TO_N.sub("N", joined)
-    # also remove anything still weird like digits/punct that may remain (turn into N then trim)
     joined = re.sub(r"[^ACGTN]", "N", joined)
     return joined
-
-def gc_content(seq: str) -> float:
-    if not seq:
-        return 0.0
-    return 100.0 * (seq.count("G") + seq.count("C")) / len(seq)
 
 def translate_frame(nt: str, frame: int) -> str:
     trimmed = nt[frame:]
@@ -100,25 +92,27 @@ def best_orf_6frames(nt: str):
             candidates.append({
                 "strand": strand,
                 "frame": frame + 1,
-                "aa": aa,
                 "aa_len_before_stop": len(pre),
                 "stop_count": aa.count("*") if aa else 0,
             })
-    best = sorted(
-        candidates,
-        key=lambda x: (x["aa_len_before_stop"], -x["stop_count"]),
-        reverse=True
-    )[0]
-    return best
+    return sorted(candidates, key=lambda x: (x["aa_len_before_stop"], -x["stop_count"]), reverse=True)[0]
 
-def align_and_score_local(ref: str, qry: str):
+def summarize_ranges(ranges):
     """
-    Local alignment to mimic BLAST-like "best matching region".
-    Returns:
-      identity_pct over aligned columns where neither is gap
-      query_coverage_pct = aligned_query_bases / len(query)
-      ref_coverage_pct   = aligned_ref_bases / len(ref)
-      aligned_len (columns where neither is gap)
+    ranges: list of (start,end)
+    returns (min_start, max_end, total_len)
+    """
+    if not ranges:
+        return None, None, 0
+    min_s = min(s for s, e in ranges)
+    max_e = max(e for s, e in ranges)
+    total = sum((e - s) for s, e in ranges)
+    return min_s, max_e, total
+
+def local_align_best_region(ref: str, qry: str):
+    """
+    Local alignment to find best matching region (not necessarily from base 1).
+    Returns a dict with identity, coverages, and coordinates on query/ref.
     """
     aligner = PairwiseAligner()
     aligner.mode = "local"
@@ -129,52 +123,70 @@ def align_and_score_local(ref: str, qry: str):
 
     alns = aligner.align(ref, qry)
     if len(alns) == 0:
-        return 0.0, 0.0, 0.0, 0
+        return {
+            "identity_pct": 0.0,
+            "qry_cov_pct": 0.0,
+            "ref_cov_pct": 0.0,
+            "aligned_pairs": 0,
+            "qry_start": None,
+            "qry_end": None,
+            "ref_start": None,
+            "ref_end": None,
+            "score": 0.0,
+        }
 
     aln = alns[0]
+
+    # Coordinates of aligned blocks for each sequence
+    # aln.aligned = (ref_ranges, qry_ranges)
+    ref_ranges = [tuple(x) for x in aln.aligned[0]]
+    qry_ranges = [tuple(x) for x in aln.aligned[1]]
+
+    ref_start, ref_end, ref_aligned_bases = summarize_ranges(ref_ranges)
+    qry_start, qry_end, qry_aligned_bases = summarize_ranges(qry_ranges)
+
+    # Compute identity using formatted alignment columns (ignore gaps)
     s = aln.format().splitlines()
-    # Biopython format usually:
-    # line0: ref with gaps
-    # line1: match markers
-    # line2: qry with gaps
     ref_aln = s[0].replace(" ", "")
     qry_aln = s[2].replace(" ", "")
 
     matches = 0
     aligned_pairs = 0
-    aligned_q_bases = 0
-    aligned_r_bases = 0
-
     for r, q in zip(ref_aln, qry_aln):
-        r_gap = (r == "-")
-        q_gap = (q == "-")
-        if not q_gap:
-            aligned_q_bases += 1
-        if not r_gap:
-            aligned_r_bases += 1
-        if (not r_gap) and (not q_gap):
+        if r != "-" and q != "-":
             aligned_pairs += 1
             if r == q:
                 matches += 1
 
     identity = (matches / aligned_pairs * 100) if aligned_pairs else 0.0
-    q_cov = (aligned_q_bases / len(qry) * 100) if len(qry) else 0.0
-    r_cov = (aligned_r_bases / len(ref) * 100) if len(ref) else 0.0
-    return identity, q_cov, r_cov, aligned_pairs
+    qry_cov = (qry_aligned_bases / len(qry) * 100) if len(qry) else 0.0
+    ref_cov = (ref_aligned_bases / len(ref) * 100) if len(ref) else 0.0
+
+    return {
+        "identity_pct": identity,
+        "qry_cov_pct": qry_cov,
+        "ref_cov_pct": ref_cov,
+        "aligned_pairs": aligned_pairs,
+        "qry_start": qry_start,
+        "qry_end": qry_end,
+        "ref_start": ref_start,
+        "ref_end": ref_end,
+        "score": float(aln.score),
+        "ref_ranges": ref_ranges,
+        "qry_ranges": qry_ranges,
+    }
 
 # =========================
 # App UI
 # =========================
-st.subheader("HA/NA Sequence Identity Quick-Check (Local alignment)")
+st.subheader("HA/NA Best-Match Region Finder (Local alignment)")
 
 sample_id = st.text_input("Sample ID")
 expected_gene = st.radio("Expected Gene", ["HA", "NA"], horizontal=True)
 query_raw = st.text_area("Paste Nucleotide Sequence (FASTA):", height=220)
 
-# Thresholds (QC rule) – can adjust
 IDENTITY_PASS = 95.0
-QRY_COVERAGE_PASS = 90.0   # how much of the query is covered by best local hit
-REF_COVERAGE_PASS = 40.0   # optional: if query is amplicon/partial, ref coverage may be low; keep modest
+QRY_COVERAGE_PASS = 90.0
 
 if st.button("Analyze Sequence", type="primary"):
     Q = clean_nt(query_raw)
@@ -185,43 +197,32 @@ if st.button("Analyze Sequence", type="primary"):
     ha_ref = clean_nt(HA_REF_RAW)
     na_ref = clean_nt(NA_REF_RAW)
 
-    # Compare to refs (LOCAL)
-    ha_id, ha_qcov, ha_rcov, ha_alnlen = align_and_score_local(ha_ref, Q)
-    na_id, na_qcov, na_rcov, na_alnlen = align_and_score_local(na_ref, Q)
+    ha = local_align_best_region(ha_ref, Q)
+    na = local_align_best_region(na_ref, Q)
 
-    # Decide gene by (identity, query coverage, aligned length)
-    if (ha_id, ha_qcov, ha_alnlen) >= (na_id, na_qcov, na_alnlen):
+    # choose by (identity, query coverage, aligned_pairs, score)
+    if (ha["identity_pct"], ha["qry_cov_pct"], ha["aligned_pairs"], ha["score"]) >= (
+        na["identity_pct"], na["qry_cov_pct"], na["aligned_pairs"], na["score"]
+    ):
         gene_identified = "HA"
-        best_identity = ha_id
-        best_qcov = ha_qcov
-        best_rcov = ha_rcov
-        best_alnlen = ha_alnlen
+        best = ha
         gene_label = HA_REF_LABEL
     else:
         gene_identified = "NA"
-        best_identity = na_id
-        best_qcov = na_qcov
-        best_rcov = na_rcov
-        best_alnlen = na_alnlen
+        best = na
         gene_label = NA_REF_LABEL
 
-    # ORF check (heuristic)
     best_orf = best_orf_6frames(Q)
     orf_investigate = (best_orf["aa_len_before_stop"] < 80) or (best_orf["stop_count"] > 1)
     orf_status = "PASS" if not orf_investigate else "INVESTIGATE"
-
-    # Critical mutation (Phase 1 placeholder)
     critical_mutation = "None (not assessed in Phase 1)"
 
-    # QC assessment rule
+    # QC decision
     if gene_identified != expected_gene:
         qc_assessment = "❌ FAIL (Gene mismatch)"
         qc_ok = False
-    elif best_identity < IDENTITY_PASS or best_qcov < QRY_COVERAGE_PASS:
-        qc_assessment = "⚠️ INVESTIGATE (Low identity/query coverage)"
-        qc_ok = False
-    elif best_rcov < REF_COVERAGE_PASS:
-        qc_assessment = "⚠️ INVESTIGATE (Low reference coverage — likely partial/short amplicon)"
+    elif best["identity_pct"] < IDENTITY_PASS or best["qry_cov_pct"] < QRY_COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low identity / query coverage)"
         qc_ok = False
     elif orf_investigate:
         qc_assessment = "⚠️ INVESTIGATE (ORF check)"
@@ -230,32 +231,58 @@ if st.button("Analyze Sequence", type="primary"):
         qc_assessment = "✅ PASS"
         qc_ok = True
 
-    # ---- Display results ----
+    # ---- Display ----
     st.markdown("---")
-    st.subheader("🔍 Analysis Result")
+    st.subheader("🔍 Analysis Result (Best matching region)")
+
     st.write(f"**Organism:** {ORGANISM_LABEL}")
-    st.write(f"**Gene Identified:** {gene_identified}  —  ({gene_label})")
+    st.write(f"**Gene Identified:** {gene_identified} — ({gene_label})")
     st.write(f"**Subtype:** {SUBTYPE_LABEL}")
 
-    st.write(f"**Identity (%):** {best_identity:.2f}")
-    st.write(f"**Query Coverage (%):** {best_qcov:.2f}")
-    st.write(f"**Reference Coverage (%):** {best_rcov:.2f}")
-    st.write(f"**Aligned length (bp, non-gap pairs):** {best_alnlen}")
+    st.write(f"**Identity (% within matched region):** {best['identity_pct']:.2f}")
+    st.write(f"**Query coverage (%):** {best['qry_cov_pct']:.2f}")
+    st.write(f"**Aligned length (bp, no-gap pairs):** {best['aligned_pairs']}")
+
+    # Coordinates (0-based internal -> show 1-based to users)
+    if best["qry_start"] is not None:
+        st.write(
+            f"**Best-hit coordinates (1-based):** "
+            f"Query {best['qry_start']+1}–{best['qry_end']}  |  "
+            f"Ref {best['ref_start']+1}–{best['ref_end']}"
+        )
+        st.caption(f"Blocks (ref): {best['ref_ranges']}  |  Blocks (query): {best['qry_ranges']}")
 
     st.write(f"**ORF Check:** {orf_status}")
     st.write(f"**Critical Mutation:** {critical_mutation}")
     st.markdown(f"### QC Assessment: {qc_assessment}")
 
-    # ---- Download report (CSV) ----
+    # Optional: show alignment text
+    with st.expander("Show alignment (best local hit)"):
+        # Recompute to get the actual alignment object text easily
+        # (quick way: run aligner again for the chosen gene)
+        aligner = PairwiseAligner()
+        aligner.mode = "local"
+        aligner.match_score = 2
+        aligner.mismatch_score = -1
+        aligner.open_gap_score = -3
+        aligner.extend_gap_score = -0.5
+        ref = ha_ref if gene_identified == "HA" else na_ref
+        aln = aligner.align(ref, Q)[0]
+        st.text(aln.format())
+
+    # ---- CSV ----
     report = pd.DataFrame([{
         "Sample ID": sample_id,
         "Expected Gene": expected_gene,
         "Gene Identified": gene_identified,
         "Subtype": SUBTYPE_LABEL,
-        "Identity (%)": round(best_identity, 2),
-        "Query Coverage (%)": round(best_qcov, 2),
-        "Reference Coverage (%)": round(best_rcov, 2),
-        "Aligned length (bp)": best_alnlen,
+        "Identity (%)": round(best["identity_pct"], 2),
+        "Query coverage (%)": round(best["qry_cov_pct"], 2),
+        "Aligned length (bp)": int(best["aligned_pairs"]),
+        "Query start (1-based)": None if best["qry_start"] is None else int(best["qry_start"] + 1),
+        "Query end (1-based)": None if best["qry_end"] is None else int(best["qry_end"]),
+        "Ref start (1-based)": None if best["ref_start"] is None else int(best["ref_start"] + 1),
+        "Ref end (1-based)": None if best["ref_end"] is None else int(best["ref_end"]),
         "ORF Check": orf_status,
         "Critical Mutation": critical_mutation,
         "QC Assessment": qc_assessment,
@@ -263,18 +290,16 @@ if st.button("Analyze Sequence", type="primary"):
         "Reference (NA)": NA_REF_LABEL
     }])
 
-    csv_bytes = report.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download QC Report (CSV)",
-        data=csv_bytes,
-        file_name=f"{sample_id or 'qc_report'}_HA_NA_identity.csv",
+        data=report.to_csv(index=False).encode("utf-8"),
+        file_name=f"{sample_id or 'qc_report'}_HA_NA_best_hit.csv",
         mime="text/csv"
     )
 
     with st.expander("Show QC thresholds used"):
         st.write(f"Identity PASS threshold: {IDENTITY_PASS}%")
         st.write(f"Query coverage PASS threshold: {QRY_COVERAGE_PASS}%")
-        st.write(f"Reference coverage PASS threshold: {REF_COVERAGE_PASS}%")
-        st.write("ORF investigate rule: best frame AA before first stop < 80 OR stop_count > 1")
+        st.write("Identity is computed only within the matched region (columns where both bases are not gaps).")
 
-st.caption("QC note: Local alignment is used to approximate a BLAST-like best-hit screening against the provided HA/NA references.")
+st.caption("QC note: This tool finds the best local matching region against the provided HA/NA references (BLAST-like screening).")
