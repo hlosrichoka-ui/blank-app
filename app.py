@@ -1,5 +1,4 @@
 import re
-import io
 import pandas as pd
 import streamlit as st
 from Bio.Seq import Seq
@@ -63,11 +62,20 @@ GTTCCAGTACAGAATTCCTGGGACAATGGAACTGGCCTGATGGGGCTAAAATAGAGTACTTCCTCTAA"""
 # =========================
 # Helpers
 # =========================
+IUPAC_TO_N = re.compile(r"[^ACGTNacgtn]")
+
 def clean_nt(seq: str) -> str:
+    """
+    Keep A/C/G/T and convert IUPAC ambiguity (e.g., Y, R, K, M, S, W, B, D, H, V) to N.
+    Do NOT delete them (deleting shifts positions and can distort alignment).
+    """
     lines = [l.strip() for l in seq.splitlines() if l.strip() and not l.strip().startswith(">")]
-    joined = "".join(lines)
-    # keep only ATGC (drop IUPAC ambiguity like Y)
-    return re.sub(r"[^ATGCatgc]", "", joined).upper()
+    joined = "".join(lines).replace(" ", "").replace("\t", "")
+    joined = joined.upper()
+    joined = IUPAC_TO_N.sub("N", joined)
+    # also remove anything still weird like digits/punct that may remain (turn into N then trim)
+    joined = re.sub(r"[^ACGTN]", "N", joined)
+    return joined
 
 def gc_content(seq: str) -> float:
     if not seq:
@@ -103,69 +111,98 @@ def best_orf_6frames(nt: str):
     )[0]
     return best
 
-def align_and_score(ref: str, qry: str):
+def align_and_score_local(ref: str, qry: str):
+    """
+    Local alignment to mimic BLAST-like "best matching region".
+    Returns:
+      identity_pct over aligned columns where neither is gap
+      query_coverage_pct = aligned_query_bases / len(query)
+      ref_coverage_pct   = aligned_ref_bases / len(ref)
+      aligned_len (columns where neither is gap)
+    """
     aligner = PairwiseAligner()
-    aligner.mode = "global"
+    aligner.mode = "local"
     aligner.match_score = 2
     aligner.mismatch_score = -1
     aligner.open_gap_score = -3
     aligner.extend_gap_score = -0.5
 
-    aln = next(iter(aligner.align(ref, qry)))
-    lines = aln.format().splitlines()
-    ref_aln = lines[0].replace(" ", "")
-    qry_aln = lines[2].replace(" ", "")
+    alns = aligner.align(ref, qry)
+    if len(alns) == 0:
+        return 0.0, 0.0, 0.0, 0
 
-    # identity over query aligned bases (non-gap in query)
+    aln = alns[0]
+    s = aln.format().splitlines()
+    # Biopython format usually:
+    # line0: ref with gaps
+    # line1: match markers
+    # line2: qry with gaps
+    ref_aln = s[0].replace(" ", "")
+    qry_aln = s[2].replace(" ", "")
+
     matches = 0
-    aligned_q = 0
+    aligned_pairs = 0
+    aligned_q_bases = 0
+    aligned_r_bases = 0
+
     for r, q in zip(ref_aln, qry_aln):
-        if q != "-":
-            aligned_q += 1
+        r_gap = (r == "-")
+        q_gap = (q == "-")
+        if not q_gap:
+            aligned_q_bases += 1
+        if not r_gap:
+            aligned_r_bases += 1
+        if (not r_gap) and (not q_gap):
+            aligned_pairs += 1
             if r == q:
                 matches += 1
 
-    identity = (matches / aligned_q * 100) if aligned_q else 0.0
-    coverage = (aligned_q / len(qry) * 100) if len(qry) else 0.0
-    return identity, coverage
+    identity = (matches / aligned_pairs * 100) if aligned_pairs else 0.0
+    q_cov = (aligned_q_bases / len(qry) * 100) if len(qry) else 0.0
+    r_cov = (aligned_r_bases / len(ref) * 100) if len(ref) else 0.0
+    return identity, q_cov, r_cov, aligned_pairs
 
 # =========================
-# App UI (matching your layout)
+# App UI
 # =========================
-st.subheader("HA/NA Sequence Identity Quick-Check")
+st.subheader("HA/NA Sequence Identity Quick-Check (Local alignment)")
 
 sample_id = st.text_input("Sample ID")
 expected_gene = st.radio("Expected Gene", ["HA", "NA"], horizontal=True)
-
 query_raw = st.text_area("Paste Nucleotide Sequence (FASTA):", height=220)
 
 # Thresholds (QC rule) – can adjust
 IDENTITY_PASS = 95.0
-COVERAGE_PASS = 90.0
+QRY_COVERAGE_PASS = 90.0   # how much of the query is covered by best local hit
+REF_COVERAGE_PASS = 40.0   # optional: if query is amplicon/partial, ref coverage may be low; keep modest
 
 if st.button("Analyze Sequence", type="primary"):
     Q = clean_nt(query_raw)
-    if not Q:
-        st.error("Please paste a valid nucleotide sequence (A/T/G/C).")
+    if not Q or set(Q) <= {"N"}:
+        st.error("Please paste a valid nucleotide sequence (A/T/G/C; IUPAC allowed).")
         st.stop()
 
     ha_ref = clean_nt(HA_REF_RAW)
     na_ref = clean_nt(NA_REF_RAW)
 
-    # Compare to refs
-    ha_id, ha_cov = align_and_score(ha_ref, Q)
-    na_id, na_cov = align_and_score(na_ref, Q)
+    # Compare to refs (LOCAL)
+    ha_id, ha_qcov, ha_rcov, ha_alnlen = align_and_score_local(ha_ref, Q)
+    na_id, na_qcov, na_rcov, na_alnlen = align_and_score_local(na_ref, Q)
 
-    # Decide gene by better (identity, coverage)
-    if (ha_id, ha_cov) >= (na_id, na_cov):
+    # Decide gene by (identity, query coverage, aligned length)
+    if (ha_id, ha_qcov, ha_alnlen) >= (na_id, na_qcov, na_alnlen):
         gene_identified = "HA"
         best_identity = ha_id
-        best_coverage = ha_cov
+        best_qcov = ha_qcov
+        best_rcov = ha_rcov
+        best_alnlen = ha_alnlen
         gene_label = HA_REF_LABEL
     else:
         gene_identified = "NA"
         best_identity = na_id
-        best_coverage = na_cov
+        best_qcov = na_qcov
+        best_rcov = na_rcov
+        best_alnlen = na_alnlen
         gene_label = NA_REF_LABEL
 
     # ORF check (heuristic)
@@ -177,12 +214,14 @@ if st.button("Analyze Sequence", type="primary"):
     critical_mutation = "None (not assessed in Phase 1)"
 
     # QC assessment rule
-    # Fail if gene mismatch vs expected OR if identity/coverage below thresholds
     if gene_identified != expected_gene:
         qc_assessment = "❌ FAIL (Gene mismatch)"
         qc_ok = False
-    elif best_identity < IDENTITY_PASS or best_coverage < COVERAGE_PASS:
-        qc_assessment = "⚠️ INVESTIGATE (Low identity/coverage)"
+    elif best_identity < IDENTITY_PASS or best_qcov < QRY_COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low identity/query coverage)"
+        qc_ok = False
+    elif best_rcov < REF_COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low reference coverage — likely partial/short amplicon)"
         qc_ok = False
     elif orf_investigate:
         qc_assessment = "⚠️ INVESTIGATE (ORF check)"
@@ -191,14 +230,18 @@ if st.button("Analyze Sequence", type="primary"):
         qc_assessment = "✅ PASS"
         qc_ok = True
 
-    # ---- Display results (as requested) ----
+    # ---- Display results ----
     st.markdown("---")
     st.subheader("🔍 Analysis Result")
     st.write(f"**Organism:** {ORGANISM_LABEL}")
     st.write(f"**Gene Identified:** {gene_identified}  —  ({gene_label})")
     st.write(f"**Subtype:** {SUBTYPE_LABEL}")
+
     st.write(f"**Identity (%):** {best_identity:.2f}")
-    st.write(f"**Coverage (%):** {best_coverage:.2f}")
+    st.write(f"**Query Coverage (%):** {best_qcov:.2f}")
+    st.write(f"**Reference Coverage (%):** {best_rcov:.2f}")
+    st.write(f"**Aligned length (bp, non-gap pairs):** {best_alnlen}")
+
     st.write(f"**ORF Check:** {orf_status}")
     st.write(f"**Critical Mutation:** {critical_mutation}")
     st.markdown(f"### QC Assessment: {qc_assessment}")
@@ -210,7 +253,9 @@ if st.button("Analyze Sequence", type="primary"):
         "Gene Identified": gene_identified,
         "Subtype": SUBTYPE_LABEL,
         "Identity (%)": round(best_identity, 2),
-        "Coverage (%)": round(best_coverage, 2),
+        "Query Coverage (%)": round(best_qcov, 2),
+        "Reference Coverage (%)": round(best_rcov, 2),
+        "Aligned length (bp)": best_alnlen,
         "ORF Check": orf_status,
         "Critical Mutation": critical_mutation,
         "QC Assessment": qc_assessment,
@@ -226,10 +271,10 @@ if st.button("Analyze Sequence", type="primary"):
         mime="text/csv"
     )
 
-    # Optional: show thresholds used
     with st.expander("Show QC thresholds used"):
         st.write(f"Identity PASS threshold: {IDENTITY_PASS}%")
-        st.write(f"Coverage PASS threshold: {COVERAGE_PASS}%")
+        st.write(f"Query coverage PASS threshold: {QRY_COVERAGE_PASS}%")
+        st.write(f"Reference coverage PASS threshold: {REF_COVERAGE_PASS}%")
         st.write("ORF investigate rule: best frame AA before first stop < 80 OR stop_count > 1")
 
-st.caption("QC note: This tool compares only to the provided HA/NA references and is intended for screening/supporting evidence.")
+st.caption("QC note: Local alignment is used to approximate a BLAST-like best-hit screening against the provided HA/NA references.")
