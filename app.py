@@ -135,9 +135,11 @@ def query_centric_local_compare(ref: str, qry: str):
     """
     LOCAL alignment (no need to start at base 1)
 
-    %Identification (matches/input_length)*100  <-- PASS when >= 95
-    Identity (aligned region)                  <-- BLAST-like
-    Coverage (of input aligned)
+    %Identification (per your definition) = matches / input_length * 100
+    Identity (aligned region)             = matches / aligned_query_bases * 100
+    Coverage (of input aligned)           = aligned_query_bases / input_length * 100
+
+    We compute everything using aln.aligned (no aln.format).
     """
     aligner = PairwiseAligner()
     aligner.mode = "local"
@@ -158,7 +160,7 @@ def query_centric_local_compare(ref: str, qry: str):
         uncovered = list(range(1, total_q + 1))
         return 0.0, 0.0, 0.0, [], [], uncovered, 0, 0, [], []
 
-    # 1-based inclusive display ranges
+    # report ranges (1-based inclusive; end is inclusive in display)
     ref_ranges = [(int(rs) + 1, int(re)) for rs, re in ref_blocks]
     qry_ranges = [(int(qs) + 1, int(qe)) for qs, qe in qry_blocks]
 
@@ -166,9 +168,13 @@ def query_centric_local_compare(ref: str, qry: str):
     mismatches = []
     insertions = []
     covered = set()
-    aligned_query_bases = 0
 
-    prev_rs = prev_re = prev_qs = prev_qe = None
+    aligned_query_bases = 0  # includes matches+mismatches+insertions (but not deletions)
+
+    prev_rs = None
+    prev_re = None
+    prev_qs = None
+    prev_qe = None
 
     for (rs, re), (qs, qe) in zip(ref_blocks, qry_blocks):
         rs, re, qs, qe = int(rs), int(re), int(qs), int(qe)
@@ -180,14 +186,18 @@ def query_centric_local_compare(ref: str, qry: str):
 
             # insertion in query: q advances but ref doesn't
             if q_gap > 0 and r_gap == 0:
-                for p0 in range(prev_qe, qs):
-                    qpos_1based = p0 + 1
-                    insertions.append(qpos_1based)
-                    covered.add(qpos_1based)
+                for p in range(prev_qe + 1, qs + 1):  # 0-based -> include those bases
+                    qpos = p  # 1-based later
+                    insertions.append(qpos)
+                    covered.add(qpos)
                 aligned_query_bases += q_gap
 
-        # aligned block comparison
+            # deletion in query: ref advances but query doesn't (no query positions to mark)
+            # if both gaps >0, treat query gap part as uncovered (rare); we ignore here.
+
+        # aligned block length
         block_len = min(re - rs, qe - qs)
+        # compare base-by-base
         for i in range(block_len):
             qpos_1based = (qs + i) + 1
             rbase = ref[rs + i]
@@ -267,26 +277,19 @@ if st.button("Analyze Sequence", type="primary"):
     best_len, stop_count = best_orf_6frames(Q)
     orf_status = "PASS" if (best_len >= 80 and stop_count <= 1) else "INVESTIGATE"
 
-    # QC Assessment (PASS when >= thresholds; use rounding to avoid float edge cases)
-    ident_check = round(ident_pct, 2)
-    cov_check = round(cov_pct, 2)
-
+    # QC Assessment
     if gene_identified != expected_gene:
         qc_assessment = "❌ FAIL (Gene mismatch)"
         qc_flag = "FAIL"
-    elif ident_check >= IDENTIFICATION_PASS and cov_check >= COVERAGE_PASS and orf_status == "PASS":
+    elif ident_pct < IDENTIFICATION_PASS or cov_pct < COVERAGE_PASS:
+        qc_assessment = "⚠️ INVESTIGATE (Low %Identification/Coverage vs thresholds)"
+        qc_flag = "INVESTIGATE"
+    elif orf_status != "PASS":
+        qc_assessment = "⚠️ INVESTIGATE (ORF check)"
+        qc_flag = "INVESTIGATE"
+    else:
         qc_assessment = "✅ PASS"
         qc_flag = "PASS"
-    else:
-        reasons = []
-        if ident_check < IDENTIFICATION_PASS:
-            reasons.append("Low %Identification")
-        if cov_check < COVERAGE_PASS:
-            reasons.append("Low Coverage")
-        if orf_status != "PASS":
-            reasons.append("ORF check")
-        qc_assessment = "⚠️ INVESTIGATE (" + ", ".join(reasons) + ")"
-        qc_flag = "INVESTIGATE"
 
     # =====================================================
     # Display results
@@ -299,14 +302,12 @@ if st.button("Analyze Sequence", type="primary"):
     st.write(f"**Subtype:** {SUBTYPE_LABEL}")
 
     st.write(f"**%Identification (matches / input length):** {ident_pct:.2f}")
-    st.caption("= (จำนวนเบสที่เหมือนกัน / จำนวนเบสของ input ทั้งหมด) × 100  | PASS when ≥ threshold")
+    st.caption("= (จำนวนเบสที่เหมือนกัน / จำนวนเบสของ input ทั้งหมด) × 100")
 
     st.write(f"**Identity (% of aligned region):** {ident_aligned:.2f}")
     st.caption("= ตรงกันกี่ % เฉพาะส่วนที่ align ได้ (BLAST-like)")
 
     st.write(f"**Coverage (% of input aligned):** {cov_pct:.2f}")
-    st.caption(f"Decision values (rounded): %Identification={ident_check:.2f}, Coverage={cov_check:.2f}")
-
     st.write(f"**ORF Check:** {orf_status}")
     st.markdown(f"### QC Assessment: {qc_assessment}")
 
@@ -381,5 +382,5 @@ if st.button("Analyze Sequence", type="primary"):
     )
 
 st.caption(
-    "LOCAL alignment; %Identification = matches / input length × 100 (PASS when ≥ threshold; e.g., 95% = PASS)."
+    "LOCAL alignment; %Identification = matches / input length × 100 (input ไม่ต้องเริ่มตรงกับ ref ที่เบสแรก)"
 )
